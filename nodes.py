@@ -21,6 +21,46 @@ _DWPOSE_DETECTORS: dict[tuple[str, str | None], Any] = {}
 _RUNTIMES: dict[tuple[str, str, str], Runtime] = {}
 
 
+def _load_cached_runtime(release_artifact: str, krea2_turbo: str, krea2_raw: str) -> Runtime:
+    """Resolve checkpoint selections and load the corresponding frozen runtime once."""
+    release_artifact_path = folder_paths.get_full_path_or_raise("checkpoints", release_artifact)
+    krea2_turbo_path = folder_paths.get_full_path_or_raise("checkpoints", krea2_turbo)
+    krea2_raw_path = folder_paths.get_full_path_or_raise("checkpoints", krea2_raw)
+    key = tuple(
+        str(Path(path).expanduser().resolve())
+        for path in (krea2_turbo_path, release_artifact_path, krea2_raw_path)
+    )
+    if key not in _RUNTIMES:
+        _RUNTIMES[key] = load_runtime(
+            turbo_path=krea2_turbo_path,
+            release_artifact=release_artifact_path,
+            base_raw_path=krea2_raw_path,
+        )
+    return _RUNTIMES[key]
+
+
+def _sample_runtime_batch(runtime: Runtime, *, prompt: str, pose_condition: torch.Tensor,
+                          seed: int, control_scale: float, steps: int, mu: float,
+                          geometry_mode: str, width: int, height: int) -> torch.Tensor:
+    """Run the canonical sampler once per ComfyUI IMAGE batch item."""
+    dimensions = (None, None) if geometry_mode == "native_aspect" else (int(width), int(height))
+    images = []
+    for offset, condition in enumerate(pose_condition):
+        output = generate(
+            runtime,
+            prompt=prompt,
+            pose_image=_image_to_pil(condition),
+            seed=int(seed) + offset,
+            control_scale=float(control_scale),
+            steps=int(steps),
+            mu=float(mu),
+            width=dimensions[0],
+            height=dimensions[1],
+        )
+        images.append(_pil_to_image(output))
+    return torch.cat(images, dim=0)
+
+
 def _image_to_pil(image: torch.Tensor) -> Image.Image:
     if image.ndim != 3 or image.shape[-1] not in (3, 4):
         raise ValueError("ComfyUI IMAGE must have H×W×3 or H×W×4 layout")
@@ -219,6 +259,56 @@ class Krea2PoseCondition:
         return (pose_control_image,)
 
 
+class Krea2PoseModelLoader:
+    """Load the frozen Krea-2 Pose runtime for use by sampler nodes."""
+    CATEGORY = "Krea2 Pose Control"
+    RETURN_TYPES = ("KREA2_POSE_RUNTIME",)
+    RETURN_NAMES = ("krea2_pose_runtime",)
+    FUNCTION = "load"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "release_artifact": (folder_paths.get_filename_list("checkpoints"),),
+            "krea2_turbo": (folder_paths.get_filename_list("checkpoints"),),
+            "krea2_raw": (folder_paths.get_filename_list("checkpoints"),),
+        }}
+
+    def load(self, release_artifact, krea2_turbo, krea2_raw):
+        return (_load_cached_runtime(release_artifact, krea2_turbo, krea2_raw),)
+
+
+class Krea2PoseSampler:
+    """Frozen Krea-2 Turbo v1 sampling from an already-loaded runtime."""
+    CATEGORY = "Krea2 Pose Control"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "sample"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "krea2_pose_runtime": ("KREA2_POSE_RUNTIME",),
+            "prompt": ("STRING", {"multiline": True, "default": ""}),
+            "pose_condition": ("IMAGE",),
+            "seed": ("INT", {"default": 42, "min": 0, "max": 2**63 - 1}),
+            "control_scale": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 2.0, "step": 0.05}),
+            "steps": ("INT", {"default": 8, "min": 8, "max": 8}),
+            "mu": ("FLOAT", {"default": 1.15, "min": 1.15, "max": 1.15, "step": 0.01}),
+            "geometry_mode": (["native_aspect", "explicit_size"], {"default": "native_aspect"}),
+            "width": ("INT", {"default": 1024, "min": 16, "max": 4096, "step": 16}),
+            "height": ("INT", {"default": 1024, "min": 16, "max": 4096, "step": 16}),
+        }}
+
+    def sample(self, krea2_pose_runtime, prompt, pose_condition, seed=42, control_scale=1.0,
+               steps=8, mu=1.15, geometry_mode="native_aspect", width=1024, height=1024):
+        return (_sample_runtime_batch(
+            krea2_pose_runtime, prompt=prompt, pose_condition=pose_condition, seed=seed,
+            control_scale=control_scale, steps=steps, mu=mu, geometry_mode=geometry_mode,
+            width=width, height=height,
+        ),)
+
+
 class Krea2PoseGenerate:
     """Frozen Krea-2 Turbo v1 generation from a project-format pose raster."""
     CATEGORY = "Krea2 Pose Control"
@@ -269,49 +359,9 @@ class Krea2PoseGenerate:
     def generate(self, prompt, pose_condition, seed=42, control_scale=1.0, steps=8, mu=1.15,
              geometry_mode="native_aspect", width=1024, height=1024,
              release_artifact="", krea2_turbo="", krea2_raw=""):
-
-        release_artifact_path = folder_paths.get_full_path_or_raise(
-            "checkpoints", release_artifact
-        )
-        krea2_turbo_path = folder_paths.get_full_path_or_raise(
-            "checkpoints", krea2_turbo
-        )
-        krea2_raw_path = folder_paths.get_full_path_or_raise(
-            "checkpoints", krea2_raw
-        )
-
-        key = (
-            str(Path(krea2_turbo_path).expanduser()),
-            str(release_artifact_path),
-            str(Path(krea2_raw_path).expanduser()),
-        )
-
-        if key not in _RUNTIMES:
-            _RUNTIMES[key] = load_runtime(
-                turbo_path=krea2_turbo_path,
-                release_artifact=release_artifact_path,
-                base_raw_path=krea2_raw_path,
-            )
-
-        dimensions = (
-            (None, None)
-            if geometry_mode == "native_aspect"
-            else (int(width), int(height))
-        )
-
-        images = []
-        for offset, condition in enumerate(pose_condition):
-            output = generate(
-                _RUNTIMES[key],
-                prompt=prompt,
-                pose_image=_image_to_pil(condition),
-                seed=int(seed) + offset,
-                control_scale=float(control_scale),
-                steps=int(steps),
-                mu=float(mu),
-                width=dimensions[0],
-                height=dimensions[1],
-            )
-            images.append(_pil_to_image(output))
-
-        return (torch.cat(images, dim=0),)
+        runtime = _load_cached_runtime(release_artifact, krea2_turbo, krea2_raw)
+        return (_sample_runtime_batch(
+            runtime, prompt=prompt, pose_condition=pose_condition, seed=seed,
+            control_scale=control_scale, steps=steps, mu=mu, geometry_mode=geometry_mode,
+            width=width, height=height,
+        ),)

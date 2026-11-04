@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-krea2-pose-control"
 description = "Pose Control LoRA nodes for Krea-2 in ComfyUI"
-version = "1.0.3"
+version = "1.1.0"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 
